@@ -16,8 +16,9 @@ concurrency:
 env:
   HW_REGION: ${{ vars.HW_REGION }}
   HW_PROJECT_ID: ${{ vars.HW_PROJECT_ID }}
-  HW_IAM_ENDPOINT: ${{ vars.HW_IAM_ENDPOINT }}
-  HW_IDP_ID: ${{ vars.HW_IDP_ID }}
+  HW_ACCOUNT_ID: ${{ vars.HW_ACCOUNT_ID }}
+  HW_AGENCY_NAME: ${{ vars.HW_AGENCY_NAME }}
+  HW_PROVIDER_NAME: ${{ vars.HW_PROVIDER_NAME }}
   HW_OIDC_AUDIENCE: ${{ vars.HW_OIDC_AUDIENCE }}
   HW_CLUSTER_ID: ${{ vars.HW_CLUSTER_ID }}
   HW_ELB_ID: ${{ vars.HW_ELB_ID }}
@@ -50,76 +51,51 @@ jobs:
           docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
             -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
 
-      - name: Authenticate to Huawei Cloud with GitHub OIDC
+      - name: Log in to Huawei Cloud (OIDC trust agency)
         run: |
           set -euo pipefail
-          JWT=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${HW_OIDC_AUDIENCE}" | jq -r .value)
-          echo "::add-mask::${JWT}"
-          HDRS=$(mktemp); BODY=$(mktemp)
-          CODE=$(curl -sS -D "$HDRS" -o "$BODY" -w '%{http_code}' -X POST \
-            "https://${HW_IAM_ENDPOINT}/v3.0/OS-AUTH/id-token/tokens" \
-            -H "Content-Type: application/json;charset=utf8" \
-            -H "X-Idp-Id: ${HW_IDP_ID}" \
-            -d "$(jq -n --arg jwt "$JWT" --arg pid "$HW_PROJECT_ID" \
-                  '{auth:{id_token:{id:$jwt},scope:{project:{id:$pid}}}}')")
-          if [ "$CODE" != "201" ] && [ "$CODE" != "200" ]; then
-            echo "IAM token exchange failed with HTTP $CODE"; cat "$BODY"; exit 1
+          for v in HW_ACCOUNT_ID HW_AGENCY_NAME HW_PROVIDER_NAME HW_OIDC_AUDIENCE HW_REGION; do
+            [ -n "${!v}" ] || { echo "MISSING VARIABLE: $v"; exit 1; }
+          done
+
+          ID_TOKEN=$(curl -sS --fail-with-body --retry 3 \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            --get --data-urlencode "audience=${HW_OIDC_AUDIENCE}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value // empty')
+          [ -n "$ID_TOKEN" ] || { echo "No OIDC token from GitHub"; exit 1; }
+          echo "::add-mask::${ID_TOKEN}"
+
+          SUB=$(cut -d. -f2 <<<"$ID_TOKEN" | tr '_-' '/+' \
+            | awk '{ while (length($0) % 4) $0 = $0 "="; print }' \
+            | base64 -d 2>/dev/null | jq -r '.sub // empty' 2>/dev/null || true)
+          echo "This run's token subject (sub): ${SUB}"
+
+          BODY=$(jq -n \
+            --arg agency   "iam::${HW_ACCOUNT_ID}:agency:${HW_AGENCY_NAME}" \
+            --arg provider "iam::${HW_ACCOUNT_ID}:oidcProvider:${HW_PROVIDER_NAME}" \
+            --arg session  "gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --arg token    "$ID_TOKEN" \
+            '{agency_urn:$agency, provider_urn:$provider, agency_session_name:$session, id_token:$token, duration_seconds:3600}')
+          RESP=$(curl -sS --retry 3 -X POST \
+            "https://sts.${HW_REGION}.myhuaweicloud.com/v5/agencies/assume-with-oidc" \
+            -H "Content-Type: application/json" -d "$BODY")
+
+          AK=$(jq -r '.credentials.access_key_id // empty'     <<<"$RESP" 2>/dev/null || true)
+          SK=$(jq -r '.credentials.secret_access_key // empty' <<<"$RESP" 2>/dev/null || true)
+          ST=$(jq -r '.credentials.security_token // empty'    <<<"$RESP" 2>/dev/null || true)
+          if [ -z "$AK" ] || [ -z "$SK" ] || [ -z "$ST" ]; then
+            echo "STS did not return credentials. Response:"; echo "$RESP"; exit 1
           fi
-          HW_TOKEN=$(grep -i '^x-subject-token:' "$HDRS" | awk '{print $2}' | tr -d '\r')
-          [ -n "$HW_TOKEN" ] || { echo "No token in response"; exit 1; }
-          echo "::add-mask::${HW_TOKEN}"
-          echo "HW_TOKEN=${HW_TOKEN}" >> "$GITHUB_ENV"
-      - name: Diagnose SWR permissions
-        run: |
-          set +e
-          echo "--- list SWR organizations with the token ---"
-          curl -sS -o /tmp/ns.json -w 'HTTP %{http_code}\n' \
-            "https://swr-api.${HW_REGION}.myhuaweicloud.com/v2/manage/namespaces" \
-            -H "X-Auth-Token: ${HW_TOKEN}" -H "Content-Type: application/json"
-          head -c 500 /tmp/ns.json; echo
-          true
+          echo "::add-mask::${AK}"; echo "::add-mask::${SK}"; echo "::add-mask::${ST}"
+          { echo "HW_ACCESS_KEY=${AK}"; echo "HW_SECRET_KEY=${SK}"; echo "HW_SECURITY_TOKEN=${ST}"; } >> "$GITHUB_ENV"
+          echo "Logged in as agency ${HW_AGENCY_NAME}"
 
       - name: Log in to SWR and push images
         run: |
-          set -euo pipefail
-          RESP=$(curl -sSf -X POST \
-            "https://swr-api.${HW_REGION}.myhuaweicloud.com/v2/manage/utils/secret?projectname=${HW_REGION}" \
-            -H "X-Auth-Token: ${HW_TOKEN}" -H "Content-Type: application/json")
-          CRED=$(echo "$RESP" | jq -r '.auths | to_entries[0].value.auth' | base64 -d)
-          SWR_USER="${CRED%%:*}"; SWR_PASS="${CRED#*:}"
+          set -uo pipefail
+          SWR_USER="${HW_REGION}@${HW_ACCESS_KEY}"
+          SWR_PASS=$(printf '%s' "${HW_ACCESS_KEY}" | openssl dgst -binary -sha256 -hmac "${HW_SECRET_KEY}" | od -An -vtx1 | tr -d ' \n')
           echo "::add-mask::${SWR_PASS}"
-          echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "swr.${HW_REGION}.myhuaweicloud.com"
-          docker push "${IMAGE}:${GITHUB_SHA}"
-          docker push "${IMAGE}:latest"
-
-      - name: Get short-lived kubeconfig from CCE
-        run: |
-          set -euo pipefail
-          KCFG="${RUNNER_TEMP}/kubeconfig"
-          curl -sSf -X POST \
-            "https://cce.${HW_REGION}.myhuaweicloud.com/api/v3/projects/${HW_PROJECT_ID}/clusters/${HW_CLUSTER_ID}/clustercert" \
-            -H "X-Auth-Token: ${HW_TOKEN}" -H "Content-Type: application/json" \
-            -d '{"duration":1}' > "$KCFG"
-          chmod 600 "$KCFG"
-          echo "KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
-          export KUBECONFIG="$KCFG"
-          kubectl config use-context externalTLSVerify || kubectl config use-context external
-          kubectl -n "${K8S_NAMESPACE}" get pods
-
-      - name: Deploy to CCE
-        run: |
-          set -euo pipefail
-          for f in k8s/deployment.yaml k8s/service.yaml; do
-            sed -e "s|__IMAGE__|${IMAGE}:${GITHUB_SHA}|g" \
-                -e "s|__ELB_ID__|${HW_ELB_ID}|g" "$f" \
-              | kubectl apply -n "${K8S_NAMESPACE}" -f -
-          done
-          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=300s
-
-      - name: Diagnostics on failure
-        if: failure()
-        run: |
-          kubectl -n "${K8S_NAMESPACE}" get pods,svc,endpoints -o wide || true
-          kubectl -n "${K8S_NAMESPACE}" describe deployment "${APP_NAME}" || true
-          kubectl -n "${K8S_NAMESPACE}" get events --sort-by=.lastTimestamp | tail -n 30 || true
+          echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "swr.${HW_REGION}.myhuaweicloud.com" || exit 1
+          docker push "${IMAGE}:${GITHUB_SHA}" || exit 1
+          docker push "${IMAGE}:latest" || exit 1
