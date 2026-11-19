@@ -1,0 +1,8 @@
+.gradle/
+build/
+.idea/
+.vscode/
+*.log
+notes.txt
+kubeconfig*
+.kube/
