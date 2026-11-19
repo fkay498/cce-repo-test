@@ -1,0 +1,33 @@
+name: oidc-test
+on: workflow_dispatch          # lets you start it by hand from the GitHub website
+permissions:
+  id-token: write              # allows the job to ask GitHub for its signed token
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exchange token
+        env:
+          HW_IAM_ENDPOINT: ${{ vars.HW_IAM_ENDPOINT }}
+          HW_IDP_ID: ${{ vars.HW_IDP_ID }}
+          HW_PROJECT_ID: ${{ vars.HW_PROJECT_ID }}
+          HW_OIDC_AUDIENCE: ${{ vars.HW_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          # 1. Ask GitHub for the signed token (the "ID card")
+          JWT=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${HW_OIDC_AUDIENCE}" | jq -r .value)
+          echo "::add-mask::$JWT"
+          # 2. Give it to Huawei IAM and see what comes back
+          curl -sS -D /tmp/headers.txt -o /tmp/body.json -X POST \
+            "https://${HW_IAM_ENDPOINT}/v3.0/OS-AUTH/id-token/tokens" \
+            -H "Content-Type: application/json;charset=utf8" -H "X-Idp-Id: ${HW_IDP_ID}" \
+            -d "$(jq -n --arg jwt "$JWT" --arg pid "$HW_PROJECT_ID" '{auth:{id_token:{id:$jwt},scope:{project:{id:$pid}}}}')" || true
+          echo "--- status line ---"
+          head -n 1 /tmp/headers.txt
+          echo "--- token header present? ---"
+          grep -qi '^x-subject-token:' /tmp/headers.txt && echo "YES, a Huawei token was issued" || echo "NO token"
+          echo "--- response body (first 500 characters, token hidden) ---"
+          head -c 500 /tmp/body.json | sed -E 's/"token".*/"token": <hidden>/'
+          echo
