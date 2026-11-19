@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: demo              # put it in the demo folder
+  labels:
+    app: demo-api
+spec:
+  replicas: 1                  # how many copies of the app to keep running
+  revisionHistoryLimit: 3      # remember 3 old versions so we can roll back
+  selector:
+    matchLabels:
+      app: demo-api            # "I manage the pods that have this label"
+  strategy:
+    type: RollingUpdate        # update by starting the new copy before stopping the old one
+    rollingUpdate:
+      maxSurge: 1              # allow 1 extra pod during an update
+      maxUnavailable: 0        # never go below the number we want
+  template:                    # the blueprint for each pod
+    metadata:
+      labels:
+        app: demo-api          # this label is how the Service finds the pod
+    spec:
+      imagePullSecrets:
+        - name: default-secret # the password the node uses to download from SWR
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: demo-api
+          image: __IMAGE__     # PLACEHOLDER. The command in Step C fills it in.
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080   # the port our Spring Boot app listens on
+              name: http
+          resources:
+            requests:          # what the pod is guaranteed
+              cpu: 250m        # a quarter of a CPU core
+              memory: 384Mi
+            limits:            # the most it may use
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:        # waits for the app to finish starting (up to 150 seconds)
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:      # decides whether the pod receives traffic
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:       # restarts the container if it hangs
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3

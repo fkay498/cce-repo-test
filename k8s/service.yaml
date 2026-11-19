@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-api
+  namespace: demo
+  annotations:
+    kubernetes.io/elb.id: "__ELB_ID__"   # PLACEHOLDER. Which ELB to use. Step C fills it in.
+    kubernetes.io/elb.class: performance # dedicated ELB
+spec:
+  type: LoadBalancer      # "expose this through a load balancer"
+  selector:
+    app: demo-api         # send traffic to pods with this label
+  ports:
+    - name: http
+      port: 80            # the port people use on the ELB
+      targetPort: 8080    # the port on the pod
+      protocol: TCP
