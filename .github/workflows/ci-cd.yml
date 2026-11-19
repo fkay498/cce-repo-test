@@ -70,6 +70,15 @@ jobs:
           [ -n "$HW_TOKEN" ] || { echo "No token in response"; exit 1; }
           echo "::add-mask::${HW_TOKEN}"
           echo "HW_TOKEN=${HW_TOKEN}" >> "$GITHUB_ENV"
+      - name: Diagnose SWR permissions
+        run: |
+          set +e
+          echo "--- list SWR organizations with the token ---"
+          curl -sS -o /tmp/ns.json -w 'HTTP %{http_code}\n' \
+            "https://swr-api.${HW_REGION}.myhuaweicloud.com/v2/manage/namespaces" \
+            -H "X-Auth-Token: ${HW_TOKEN}" -H "Content-Type: application/json"
+          head -c 500 /tmp/ns.json; echo
+          true
 
       - name: Log in to SWR and push images
         run: |
