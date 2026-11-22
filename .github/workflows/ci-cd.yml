@@ -33,24 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-
-      - name: Run tests
-        run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon test
-
-      - name: Build Docker image (linux/amd64)
-        run: |
-          IMAGE="swr.${HW_REGION}.myhuaweicloud.com/${SWR_ORG}/${APP_NAME}"
-          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
-          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
-            -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
-
+      # ---- Stage 1: OIDC login (runs first so problems show up in ~1 minute) ----
       - name: Log in to Huawei Cloud (OIDC trust agency)
         run: |
           set -euo pipefail
@@ -90,6 +73,26 @@ jobs:
           { echo "HW_ACCESS_KEY=${AK}"; echo "HW_SECRET_KEY=${SK}"; echo "HW_SECURITY_TOKEN=${ST}"; } >> "$GITHUB_ENV"
           echo "Logged in as agency ${HW_AGENCY_NAME}"
 
+      # ---- Stage 2: build and test ----
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Run tests
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon test
+
+      - name: Build Docker image (linux/amd64)
+        run: |
+          IMAGE="swr.${HW_REGION}.myhuaweicloud.com/${SWR_ORG}/${APP_NAME}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
+            -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
+
+      # ---- Stage 3: push to SWR ----
       - name: Install Huawei Cloud Python SDK
         run: |
           python3 -m venv /tmp/hwsdk
@@ -128,3 +131,5 @@ jobs:
           echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "swr.${HW_REGION}.myhuaweicloud.com"
           docker push "${IMAGE}:${GITHUB_SHA}"
           docker push "${IMAGE}:latest"
+
+      # ---- Stage 4 (not added yet): deploy to CCE ----
