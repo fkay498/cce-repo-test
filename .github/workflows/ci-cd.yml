@@ -99,37 +99,15 @@ jobs:
           /tmp/hwsdk/bin/pip install --quiet huaweicloudsdkswr huaweicloudsdkcce
           echo "/tmp/hwsdk/bin" >> "$GITHUB_PATH"
 
-      - name: Log in to SWR and push images
+      -      - name: Log in to SWR and push images
         run: |
           set -euo pipefail
-          python - <<'PY' > /tmp/swr_auth.txt
-          import os
-          from huaweicloudsdkcore.auth.credentials import BasicCredentials
-          from huaweicloudsdkswr.v2 import SwrClient, CreateSecretRequest
-
-          region = os.environ["HW_REGION"]
-          cred = BasicCredentials(os.environ["HW_ACCESS_KEY"], os.environ["HW_SECRET_KEY"],
-                                  os.environ["HW_PROJECT_ID"]).with_security_token(os.environ["HW_SECURITY_TOKEN"])
-          endpoint = f"https://swr-api.{region}.myhuaweicloud.com"
-          builder = SwrClient.new_builder().with_credentials(cred)
-          builder = builder.with_endpoints([endpoint]) if hasattr(builder, "with_endpoints") else builder.with_endpoint(endpoint)
-          client = builder.build()
-
-          resp = client.create_secret(CreateSecretRequest(projectname=region))
-          auths = resp.to_dict().get("auths") or {}
-          for host, info in auths.items():
-              print(info["auth"])
-              break
-          PY
-          AUTH=$(head -n 1 /tmp/swr_auth.txt)
-          [ -n "$AUTH" ] || { echo "SWR returned no login"; exit 1; }
-          echo "::add-mask::${AUTH}"
-          CRED=$(echo "$AUTH" | base64 -d)
-          SWR_USER="${CRED%%:*}"; SWR_PASS="${CRED#*:}"
+          SWR_HOST="swr.${HW_REGION}.myhuaweicloud.com"
+          SWR_USER="${HW_REGION}@${HW_ACCESS_KEY}"
+          SWR_PASS=$(printf '%s' "${HW_ACCESS_KEY}" \
+            | openssl dgst -binary -sha256 -hmac "${HW_SECRET_KEY}" \
+            | od -An -vtx1 | tr -d ' \n')
           echo "::add-mask::${SWR_PASS}"
-          echo "SWR username starts with: ${SWR_USER:0:14}"
-          echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "swr.${HW_REGION}.myhuaweicloud.com"
+          echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "${SWR_HOST}"
           docker push "${IMAGE}:${GITHUB_SHA}"
           docker push "${IMAGE}:latest"
-
-      # ---- Stage 4 (not added yet): deploy to CCE ----
