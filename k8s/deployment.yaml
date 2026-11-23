@@ -12,10 +12,14 @@ spec:
     matchLabels:
       app: demo-api            # "I manage the pods that have this label"
   strategy:
-    type: RollingUpdate        # update by starting the new copy before stopping the old one
+    type: RollingUpdate        # update one pod at a time
     rollingUpdate:
-      maxSurge: 1              # allow 1 extra pod during an update
-      maxUnavailable: 0        # never go below the number we want
+      # The cluster has ONE node and it lacks memory for two copies at once
+      # ("Insufficient memory"), so stop the old pod first, then start the new one.
+      # This means ~1 minute of downtime per deploy. With a second node you can
+      # go back to maxSurge: 1 / maxUnavailable: 0 for zero-downtime updates.
+      maxSurge: 0              # no extra pod during an update
+      maxUnavailable: 1        # the old pod may stop before the new one is ready
   template:                    # the blueprint for each pod
     metadata:
       labels:
