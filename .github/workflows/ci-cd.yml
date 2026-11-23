@@ -92,15 +92,66 @@ jobs:
           docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
             -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
 
-               # ---- Stage 3: push to SWR ----
-      - name: Log in to SWR and push images
+      # ---- Stage 3: push to SWR ----
+      # The temporary AK/SK from OIDC cannot be used directly as a docker password
+      # (HMAC login and SK#token both give "Authenticate Error"), and the old
+      # CreateSecret API rejects agency sessions with SWR.4002047 "Have NOT set akey/skey".
+      # The newer CreateAuthorizationToken API issues a short-lived "bearertoken@..."
+      # docker login, signed here with the temporary AK/SK + security token.
+      # The agency needs: swr::createAuthorizationToken, sts::createServiceBearerToken,
+      # and push rights on the SWR organization.
+      - name: Install Huawei Cloud SWR SDK
+        run: |
+          python3 -m venv /tmp/hwsdk
+          /tmp/hwsdk/bin/pip install --quiet --upgrade huaweicloudsdkcore huaweicloudsdkswr
+
+      - name: Log in to SWR (temporary bearer token) and push images
         run: |
           set -euo pipefail
           SWR_HOST="swr.${HW_REGION}.myhuaweicloud.com"
-          SWR_USER="${HW_ACCESS_KEY}"
-          SWR_PASS="${HW_SECRET_KEY}#${HW_SECURITY_TOKEN}"
+          AUTH=$(/tmp/hwsdk/bin/python - <<'PY'
+          import base64, os, sys
+          from huaweicloudsdkcore.auth.credentials import BasicCredentials
+          from huaweicloudsdkcore.exceptions import exceptions
+          from huaweicloudsdkswr.v2 import SwrClient, CreateAuthorizationTokenRequest
+
+          region = os.environ["HW_REGION"]
+          cred = (BasicCredentials(os.environ["HW_ACCESS_KEY"], os.environ["HW_SECRET_KEY"],
+                                   os.environ["HW_PROJECT_ID"])
+                  .with_security_token(os.environ["HW_SECURITY_TOKEN"]))
+          client = (SwrClient.new_builder()
+                    .with_credentials(cred)
+                    .with_endpoints([f"https://swr-api.{region}.myhuaweicloud.com"])
+                    .build())
+          try:
+              resp = client.create_authorization_token(CreateAuthorizationTokenRequest())
+          except exceptions.ClientRequestException as e:
+              print(f"SWR CreateAuthorizationToken failed: {e.status_code} {e.error_code} {e.error_msg}",
+                    file=sys.stderr)
+              sys.exit(1)
+
+          # Preferred: body {"auths": {"<host>": {"auth": base64("user:password")}}}
+          auths = (resp.to_dict() or {}).get("auths") or {}
+          for info in auths.values():
+              if info and info.get("auth"):
+                  print(info["auth"]); sys.exit(0)
+
+          # Fallback: X-Swr-Dockerlogin header "docker login -u USER -p PASS [host]"
+          cmd = getattr(resp, "x_swr_dockerlogin", None) or ""
+          parts = cmd.split()
+          if "-u" in parts and "-p" in parts:
+              user = parts[parts.index("-u") + 1]; pwd = parts[parts.index("-p") + 1]
+              print(base64.b64encode(f"{user}:{pwd}".encode()).decode()); sys.exit(0)
+
+          print("SWR returned no login credentials", file=sys.stderr); sys.exit(1)
+          PY
+          )
+          echo "::add-mask::${AUTH}"
+          CRED=$(printf '%s' "$AUTH" | base64 -d)
+          SWR_USER="${CRED%%:*}"; SWR_PASS="${CRED#*:}"
           echo "::add-mask::${SWR_PASS}"
-          echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "${SWR_HOST}"
+          echo "SWR login user type: ${SWR_USER%%@*}"
+          printf '%s' "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "${SWR_HOST}"
           docker push "${IMAGE}:${GITHUB_SHA}"
           docker push "${IMAGE}:latest"
 
