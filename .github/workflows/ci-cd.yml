@@ -201,7 +201,9 @@ jobs:
               json.dump(kc, f)
           os.chmod(sys.argv[1], 0o600)
           PY
+          # $GITHUB_ENV only applies to LATER steps, so also export it for this one
           echo "KUBECONFIG=${KUBECONFIG_FILE}" >> "$GITHUB_ENV"
+          export KUBECONFIG="${KUBECONFIG_FILE}"
           kubectl version --request-timeout=20s
           kubectl get nodes --request-timeout=20s
 
