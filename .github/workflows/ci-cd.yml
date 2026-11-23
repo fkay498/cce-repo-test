@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- Stage 1: OIDC login (runs first so problems show up in ~1 minute) ----
+      # ---- Stage 1: OIDC login ----
       - name: Log in to Huawei Cloud (OIDC trust agency)
         run: |
           set -euo pipefail
@@ -93,13 +93,7 @@ jobs:
             -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
 
       # ---- Stage 3: push to SWR ----
-      - name: Install Huawei Cloud Python SDK
-        run: |
-          python3 -m venv /tmp/hwsdk
-          /tmp/hwsdk/bin/pip install --quiet huaweicloudsdkswr huaweicloudsdkcce
-          echo "/tmp/hwsdk/bin" >> "$GITHUB_PATH"
-
-      -      - name: Log in to SWR and push images
+      - name: Log in to SWR and push images
         run: |
           set -euo pipefail
           SWR_HOST="swr.${HW_REGION}.myhuaweicloud.com"
@@ -111,3 +105,5 @@ jobs:
           echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "${SWR_HOST}"
           docker push "${IMAGE}:${GITHUB_SHA}"
           docker push "${IMAGE}:latest"
+
+      # ---- Stage 4 (not added yet): deploy to CCE ----
