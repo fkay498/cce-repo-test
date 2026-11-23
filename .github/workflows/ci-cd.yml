@@ -249,6 +249,10 @@ jobs:
           if ! kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=5m; then
             echo "Rollout failed. Pods and recent events:"
             kubectl -n "${K8S_NAMESPACE}" get pods -o wide || true
+            echo "Why each pod is not scheduled / not ready (from the pod's own status):"
+            kubectl -n "${K8S_NAMESPACE}" get pods -l "app=${APP_NAME}" -o \
+              jsonpath='{range .items[*]}{.metadata.name}{": "}{range .status.conditions[?(@.status=="False")]}{.type}{" -> "}{.message}{"  "}{end}{"\n"}{end}' || true
+            kubectl -n "${K8S_NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 | tail -15 || true
             kubectl -n "${K8S_NAMESPACE}" describe pods -l "app=${APP_NAME}" | tail -40 || true
             exit 1
           fi
