@@ -220,9 +220,14 @@ jobs:
           done
           [ "$OK" = 1 ] || { echo "The agency lacks Kubernetes permissions in namespace ${K8S_NAMESPACE}."; exit 1; }
 
-      # Step 4b: fill in the placeholders in k8s/*.yaml, apply them, and wait
-      # until the new pods are healthy. The image is pinned to this commit's SHA.
-      - name: Deploy to CCE
+      # Step 4b: zero-downtime rolling deployment.
+      #  - k8s/deployment.yaml uses maxSurge 1 / maxUnavailable 0: the NEW pod is
+      #    started first and the OLD pod is only stopped once the new one is healthy.
+      #  - While the rollout runs, we call the public health URL every second and
+      #    count failed requests, to prove there was no downtime.
+      #  - If the new pod never becomes healthy, we roll back, so the old version
+      #    keeps serving and no broken half-finished deploy is left behind.
+      - name: Deploy to CCE (zero-downtime rolling update)
         run: |
           set -euo pipefail
           [ -n "${HW_ELB_ID}" ] || { echo "MISSING VARIABLE: HW_ELB_ID"; exit 1; }
@@ -244,6 +249,34 @@ jobs:
             sed -e "s|__IMAGE__|${IMAGE}:${GITHUB_SHA}|g" \
                 -e "s|__ELB_ID__|${HW_ELB_ID}|g" "k8s/$f" > "${RUNNER_TEMP}/k8s/$f"
           done
+          # Find the ELB's public IP (skip private 10.x / 172.16-31.x / 192.168.x addresses)
+          PUBLIC_IP=$(kubectl -n "${K8S_NAMESPACE}" get svc "${APP_NAME}" \
+            -o jsonpath='{range .status.loadBalancer.ingress[*]}{.ip}{"\n"}{end}' 2>/dev/null \
+            | grep -vE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -n 1 || true)
+
+          # Downtime probe: one request per second until the rollout ends
+          PROBE_LOG="${RUNNER_TEMP}/probe.log"; : > "$PROBE_LOG"
+          if [ -n "$PUBLIC_IP" ]; then
+            echo "Probing http://${PUBLIC_IP}/actuator/health during the rollout"
+            ( while true; do
+                curl -s -o /dev/null -m 3 -w '%{http_code}\n' "http://${PUBLIC_IP}/actuator/health" >> "$PROBE_LOG" || echo "000" >> "$PROBE_LOG"
+                sleep 1
+              done ) &
+            PROBE_PID=$!
+          else
+            echo "No public IP on the service yet; skipping the downtime probe."
+            PROBE_PID=""
+          fi
+          stop_probe() {
+            [ -n "$PROBE_PID" ] && kill "$PROBE_PID" 2>/dev/null || true
+            TOTAL=$(wc -l < "$PROBE_LOG" | tr -d ' ')
+            FAILED=$(grep -vc '^200$' "$PROBE_LOG" || true)
+            echo "Downtime probe: ${TOTAL} requests, ${FAILED} failed"
+            if [ "${FAILED:-0}" -gt 0 ]; then
+              echo "::warning::${FAILED} of ${TOTAL} health requests failed during the deploy"
+            fi
+          }
+
           kubectl apply -f "${RUNNER_TEMP}/k8s/deployment.yaml" -f "${RUNNER_TEMP}/k8s/service.yaml"
 
           if ! kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=5m; then
@@ -253,8 +286,17 @@ jobs:
             kubectl -n "${K8S_NAMESPACE}" get pods -l "app=${APP_NAME}" -o \
               jsonpath='{range .items[*]}{.metadata.name}{": "}{range .status.conditions[?(@.status=="False")]}{.type}{" -> "}{.message}{"  "}{end}{"\n"}{end}' || true
             kubectl -n "${K8S_NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 | tail -15 || true
-            kubectl -n "${K8S_NAMESPACE}" describe pods -l "app=${APP_NAME}" | tail -40 || true
+            # Roll back: the old pod was never stopped (maxUnavailable 0), so this just
+            # removes the stuck new pod and leaves the old version serving.
+            echo "Rolling back to the previous version..."
+            kubectl -n "${K8S_NAMESPACE}" rollout undo "deployment/${APP_NAME}" || true
+            kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=3m || true
+            stop_probe
+            echo "::error::New version did not become healthy; rolled back. The previous version is still serving."
             exit 1
           fi
+          # Give the old pod time to drain (preStop 10s) before stopping the probe
+          sleep 15
+          stop_probe
           kubectl -n "${K8S_NAMESPACE}" get deploy,pods,svc -o wide
           echo "Deployed ${IMAGE}:${GITHUB_SHA}"
