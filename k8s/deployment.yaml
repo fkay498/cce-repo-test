@@ -12,14 +12,13 @@ spec:
     matchLabels:
       app: demo-api            # "I manage the pods that have this label"
   strategy:
-    type: RollingUpdate        # update one pod at a time
+    type: RollingUpdate        # zero downtime: start the new pod, THEN stop the old one
     rollingUpdate:
-      # The cluster has ONE node and it lacks memory for two copies at once
-      # ("Insufficient memory"), so stop the old pod first, then start the new one.
-      # This means ~1 minute of downtime per deploy. With a second node you can
-      # go back to maxSurge: 1 / maxUnavailable: 0 for zero-downtime updates.
-      maxSurge: 0              # no extra pod during an update
-      maxUnavailable: 1        # the old pod may stop before the new one is ready
+      # The cluster must have room for TWO copies during a deploy
+      # (2 x 384Mi memory requested), otherwise the new pod stays Pending.
+      maxSurge: 1              # allow 1 extra pod during an update
+      maxUnavailable: 0        # never stop the old pod before the new one is ready
+  minReadySeconds: 5           # new pod must stay ready 5s before the old one is stopped
   template:                    # the blueprint for each pod
     metadata:
       labels:
@@ -27,11 +26,15 @@ spec:
     spec:
       imagePullSecrets:
         - name: default-secret # the password the node uses to download from SWR
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 40   # 10s preStop + 20s Spring shutdown + margin
       containers:
         - name: demo-api
           image: __IMAGE__     # PLACEHOLDER. The command in Step C fills it in.
           imagePullPolicy: Always
+          lifecycle:
+            preStop:           # when the old pod is told to stop, wait 10s first so the
+              exec:            # ELB and Service stop sending it traffic, THEN Spring Boot
+                command: ["sleep", "10"]   # shuts down gracefully (20s).
           ports:
             - containerPort: 8080   # the port our Spring Boot app listens on
               name: http
