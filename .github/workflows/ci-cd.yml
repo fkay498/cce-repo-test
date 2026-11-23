@@ -205,7 +205,20 @@ jobs:
           echo "KUBECONFIG=${KUBECONFIG_FILE}" >> "$GITHUB_ENV"
           export KUBECONFIG="${KUBECONFIG_FILE}"
           kubectl version --request-timeout=20s
-          kubectl get nodes --request-timeout=20s
+          # Show which Kubernetes permissions the agency has in the app namespace.
+          # Grant them in CCE console > cluster > Permissions (agency github-actions).
+          echo "RBAC check in namespace ${K8S_NAMESPACE}:"
+          OK=1
+          for r in deployments services secrets; do
+            for v in get create patch; do
+              if kubectl auth can-i "$v" "$r" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
+                echo "  yes  $v $r"
+              else
+                echo "  NO   $v $r"; OK=0
+              fi
+            done
+          done
+          [ "$OK" = 1 ] || { echo "The agency lacks Kubernetes permissions in namespace ${K8S_NAMESPACE}."; exit 1; }
 
       # Step 4b: fill in the placeholders in k8s/*.yaml, apply them, and wait
       # until the new pods are healthy. The image is pinned to this commit's SHA.
@@ -213,7 +226,12 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${HW_ELB_ID}" ] || { echo "MISSING VARIABLE: HW_ELB_ID"; exit 1; }
-          kubectl apply -f k8s/namespace.yaml
+          # Creating a namespace is a cluster-wide right; only do it if we have it.
+          if kubectl auth can-i create namespaces >/dev/null 2>&1; then
+            kubectl apply -f k8s/namespace.yaml
+          else
+            echo "No cluster-wide namespace rights; assuming namespace ${K8S_NAMESPACE} already exists."
+          fi
 
           # CCE creates "default-secret" (SWR pull secret) in new namespaces; wait for it
           for i in $(seq 1 12); do
