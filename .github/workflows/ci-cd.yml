@@ -100,10 +100,10 @@ jobs:
       # docker login, signed here with the temporary AK/SK + security token.
       # The agency needs: swr::createAuthorizationToken, sts::createServiceBearerToken,
       # and push rights on the SWR organization.
-      - name: Install Huawei Cloud SWR SDK
+      - name: Install Huawei Cloud SDK (SWR + CCE)
         run: |
           python3 -m venv /tmp/hwsdk
-          /tmp/hwsdk/bin/pip install --quiet --upgrade huaweicloudsdkcore huaweicloudsdkswr
+          /tmp/hwsdk/bin/pip install --quiet --upgrade huaweicloudsdkcore huaweicloudsdkswr huaweicloudsdkcce
 
       - name: Log in to SWR (temporary bearer token) and push images
         run: |
@@ -155,4 +155,82 @@ jobs:
           docker push "${IMAGE}:${GITHUB_SHA}"
           docker push "${IMAGE}:latest"
 
-      # ---- Stage 4 (not added yet): deploy to CCE ----
+      # ---- Stage 4: deploy to CCE ----
+      # Step 4a: ask CCE for a short-lived kubeconfig (1 day), using the same
+      # temporary OIDC credentials. GitHub runners are on the internet, so the
+      # cluster's API server must have a public EIP ("external" context).
+      - name: Get CCE kubeconfig (temporary)
+        run: |
+          set -euo pipefail
+          [ -n "${HW_CLUSTER_ID}" ] || { echo "MISSING VARIABLE: HW_CLUSTER_ID"; exit 1; }
+          KUBECONFIG_FILE="${RUNNER_TEMP}/kubeconfig"
+          /tmp/hwsdk/bin/python - "$KUBECONFIG_FILE" <<'PY'
+          import json, os, sys
+          from huaweicloudsdkcore.auth.credentials import BasicCredentials
+          from huaweicloudsdkcore.exceptions import exceptions
+          from huaweicloudsdkcore.utils.http_utils import sanitize_for_serialization
+          from huaweicloudsdkcce.v3 import CceClient, CreateKubernetesClusterCertRequest, CertDuration
+
+          region = os.environ["HW_REGION"]
+          cred = (BasicCredentials(os.environ["HW_ACCESS_KEY"], os.environ["HW_SECRET_KEY"],
+                                   os.environ["HW_PROJECT_ID"])
+                  .with_security_token(os.environ["HW_SECURITY_TOKEN"]))
+          client = (CceClient.new_builder()
+                    .with_credentials(cred)
+                    .with_endpoints([f"https://cce.{region}.myhuaweicloud.com"])
+                    .build())
+          try:
+              resp = client.create_kubernetes_cluster_cert(CreateKubernetesClusterCertRequest(
+                  cluster_id=os.environ["HW_CLUSTER_ID"], body=CertDuration(duration=1)))
+          except exceptions.ClientRequestException as e:
+              print(f"CCE kubeconfig request failed: {e.status_code} {e.error_code} {e.error_msg}",
+                    file=sys.stderr)
+              sys.exit(1)
+
+          # Turn the SDK object back into a real kubeconfig (kubectl reads JSON too)
+          kc = sanitize_for_serialization(resp)
+          kc.pop("Port-ID", None)
+          names = [c["name"] for c in kc.get("contexts", [])]
+          print("Contexts in kubeconfig:", names)
+          if "external" not in names:
+              print("No 'external' context: bind an EIP to the cluster's API server "
+                    "(CCE console > cluster > Connection Information).", file=sys.stderr)
+              sys.exit(1)
+          kc["current-context"] = "external"
+          with open(sys.argv[1], "w") as f:
+              json.dump(kc, f)
+          os.chmod(sys.argv[1], 0o600)
+          PY
+          echo "KUBECONFIG=${KUBECONFIG_FILE}" >> "$GITHUB_ENV"
+          kubectl version --request-timeout=20s
+          kubectl get nodes --request-timeout=20s
+
+      # Step 4b: fill in the placeholders in k8s/*.yaml, apply them, and wait
+      # until the new pods are healthy. The image is pinned to this commit's SHA.
+      - name: Deploy to CCE
+        run: |
+          set -euo pipefail
+          [ -n "${HW_ELB_ID}" ] || { echo "MISSING VARIABLE: HW_ELB_ID"; exit 1; }
+          kubectl apply -f k8s/namespace.yaml
+
+          # CCE creates "default-secret" (SWR pull secret) in new namespaces; wait for it
+          for i in $(seq 1 12); do
+            kubectl -n "${K8S_NAMESPACE}" get secret default-secret >/dev/null 2>&1 && break
+            echo "Waiting for default-secret in ${K8S_NAMESPACE}..."; sleep 5
+          done
+
+          mkdir -p "${RUNNER_TEMP}/k8s"
+          for f in deployment.yaml service.yaml; do
+            sed -e "s|__IMAGE__|${IMAGE}:${GITHUB_SHA}|g" \
+                -e "s|__ELB_ID__|${HW_ELB_ID}|g" "k8s/$f" > "${RUNNER_TEMP}/k8s/$f"
+          done
+          kubectl apply -f "${RUNNER_TEMP}/k8s/deployment.yaml" -f "${RUNNER_TEMP}/k8s/service.yaml"
+
+          if ! kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=5m; then
+            echo "Rollout failed. Pods and recent events:"
+            kubectl -n "${K8S_NAMESPACE}" get pods -o wide || true
+            kubectl -n "${K8S_NAMESPACE}" describe pods -l "app=${APP_NAME}" | tail -40 || true
+            exit 1
+          fi
+          kubectl -n "${K8S_NAMESPACE}" get deploy,pods,svc -o wide
+          echo "Deployed ${IMAGE}:${GITHUB_SHA}"
