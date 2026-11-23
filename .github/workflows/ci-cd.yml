@@ -92,15 +92,13 @@ jobs:
           docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
             -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
 
-      # ---- Stage 3: push to SWR ----
+               # ---- Stage 3: push to SWR ----
       - name: Log in to SWR and push images
         run: |
           set -euo pipefail
           SWR_HOST="swr.${HW_REGION}.myhuaweicloud.com"
-          SWR_USER="${HW_REGION}@${HW_ACCESS_KEY}"
-          SWR_PASS=$(printf '%s' "${HW_ACCESS_KEY}" \
-            | openssl dgst -binary -sha256 -hmac "${HW_SECRET_KEY}" \
-            | od -An -vtx1 | tr -d ' \n')
+          SWR_USER="${HW_ACCESS_KEY}"
+          SWR_PASS="${HW_SECRET_KEY}#${HW_SECURITY_TOKEN}"
           echo "::add-mask::${SWR_PASS}"
           echo "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "${SWR_HOST}"
           docker push "${IMAGE}:${GITHUB_SHA}"
