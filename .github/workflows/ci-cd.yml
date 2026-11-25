@@ -295,7 +295,7 @@ jobs:
             kubectl -n "${NS}" delete svc "${APP_NAME}" --wait=true
           fi
           kubectl apply -f "${RUNNER_TEMP}/k8s/service.yaml" -f "${RUNNER_TEMP}/k8s/app2.yaml"
-          if ! kubectl -n "${NS}" rollout status deployment/app2 --timeout=3m; then
+          if ! kubectl -n "${NS}" rollout status deployment/app2 --timeout=10m; then
             echo "app2 did not become ready:"; diag
             kubectl -n "${NS}" rollout undo deployment/app2 || true
             exit 1
