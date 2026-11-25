@@ -98,12 +98,6 @@ jobs:
           docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
             -t "${IMAGE_APP2}:${GITHUB_SHA}" -t "${IMAGE_APP2}:latest" app2
 
-          # Third sample app (app3/): TEMPORARY, for the node-count test
-          IMAGE_APP3="swr.${HW_REGION}.myhuaweicloud.com/${SWR_ORG}/app3"
-          echo "IMAGE_APP3=${IMAGE_APP3}" >> "$GITHUB_ENV"
-          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
-            -t "${IMAGE_APP3}:${GITHUB_SHA}" -t "${IMAGE_APP3}:latest" app3
-
       # ---- Stage 3: push to SWR ----
       # The temporary AK/SK from OIDC cannot be used directly as a docker password
       # (HMAC login and SK#token both give "Authenticate Error"), and the old
@@ -168,8 +162,6 @@ jobs:
           docker push "${IMAGE}:latest"
           docker push "${IMAGE_APP2}:${GITHUB_SHA}"
           docker push "${IMAGE_APP2}:latest"
-          docker push "${IMAGE_APP3}:${GITHUB_SHA}"
-          docker push "${IMAGE_APP3}:latest"
 
       # ---- Stage 4: deploy to CCE ----
       # Step 4a: ask CCE for a short-lived kubeconfig (1 day), using the same
@@ -269,10 +261,9 @@ jobs:
 
           # Fill in the placeholders
           mkdir -p "${RUNNER_TEMP}/k8s"
-          for f in deployment.yaml service.yaml app2.yaml app3.yaml ingress.yaml; do
+          for f in deployment.yaml service.yaml app2.yaml ingress.yaml; do
             sed -e "s|__IMAGE__|${IMAGE}:${GITHUB_SHA}|g" \
                 -e "s|__IMAGE_APP2__|${IMAGE_APP2}:${GITHUB_SHA}|g" \
-                -e "s|__IMAGE_APP3__|${IMAGE_APP3}:${GITHUB_SHA}|g" \
                 -e "s|__ELB_ID__|${HW_ELB_ID}|g" "k8s/$f" > "${RUNNER_TEMP}/k8s/$f"
           done
 
@@ -309,13 +300,6 @@ jobs:
             kubectl -n "${NS}" rollout undo deployment/app2 || true
             exit 1
           fi
-          # TEMPORARY third app (node-count test)
-          kubectl apply -f "${RUNNER_TEMP}/k8s/app3.yaml"
-          if ! kubectl -n "${NS}" rollout status deployment/app3 --timeout=10m; then
-            echo "app3 did not become ready:"; diag
-            kubectl -n "${NS}" rollout undo deployment/app3 || true
-            exit 1
-          fi
 
           # ---- 2. Ingress takes over the ELB's port-80 listener ----
           # Wait until demo-api's Service no longer holds the ELB (only matters on the first run)
@@ -324,6 +308,11 @@ jobs:
             echo "Waiting for CCE to release the ELB listener from the demo-api Service..."; sleep 5
           done
           kubectl apply -f "${RUNNER_TEMP}/k8s/ingress.yaml"
+          # Clean up apps that were removed from the repo (kubectl apply never deletes
+          # anything by itself). Runs after the Ingress stops routing to them.
+          # Safe to keep: --ignore-not-found does nothing once they are gone.
+          kubectl -n "${NS}" delete deployment/app3 service/app3 --ignore-not-found \
+            || echo "::warning::Could not delete the old app3 resources (check the agency's delete permission)"
           for i in $(seq 1 36); do
             IP="$(public_ip ingress/apps)"
             [ -n "$IP" ] && { ELB_PUBLIC_IP="$IP"; break; }
@@ -410,7 +399,6 @@ jobs:
           ROUTING_OK=1
           check /actuator/health '"status":"UP"' || ROUTING_OK=0
           check /app2/hello '"app":"app2"' || ROUTING_OK=0
-          check /app3/hello '"app":"app3"' || ROUTING_OK=0
           if [ "$ROUTING_OK" = 0 ]; then
             kubectl -n "${NS}" describe ingress apps | tail -25 || true
             echo "::error::The Ingress is not routing both apps through the ELB."; exit 1
@@ -422,4 +410,4 @@ jobs:
           if kubectl -n "${NS}" get hpa "${APP_NAME}" -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].status}' 2>/dev/null | grep -q False; then
             echo "::warning::HPA cannot read CPU metrics yet. Install the 'Kubernetes Metrics Server' add-on in CCE."
           fi
-          echo "Deployed ${IMAGE}, ${IMAGE_APP2} and ${IMAGE_APP3} (tag ${GITHUB_SHA}) behind ELB ${ELB_PUBLIC_IP}"
+          echo "Deployed ${IMAGE}:${GITHUB_SHA} and ${IMAGE_APP2}:${GITHUB_SHA} behind ELB ${ELB_PUBLIC_IP}"
