@@ -285,6 +285,15 @@ jobs:
           ELB_PUBLIC_IP="$(public_ip "svc/${APP_NAME}")"
 
           # ---- 1. app2 and the internal Services ----
+          # One-time migration: CCE refuses to detach an existing Service from its ELB
+          # ("can't modify service elb annotation"), so if demo-api's Service is still a
+          # LoadBalancer we delete it and recreate it as an internal NodePort Service.
+          # The ELB itself is kept (it was created in the console and is referenced by ID);
+          # only its port-80 listener is removed, and the Ingress recreates it below.
+          if [ "$(kubectl -n "${NS}" get svc "${APP_NAME}" -o jsonpath='{.spec.type}' 2>/dev/null)" = "LoadBalancer" ]; then
+            echo "One-time migration: replacing the LoadBalancer Service ${APP_NAME} with a NodePort Service"
+            kubectl -n "${NS}" delete svc "${APP_NAME}" --wait=true
+          fi
           kubectl apply -f "${RUNNER_TEMP}/k8s/service.yaml" -f "${RUNNER_TEMP}/k8s/app2.yaml"
           if ! kubectl -n "${NS}" rollout status deployment/app2 --timeout=3m; then
             echo "app2 did not become ready:"; diag
