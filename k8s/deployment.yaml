@@ -28,7 +28,7 @@ spec:
       # Run ONLY on the new node pool (it has auto scaling), never on DefaultPool.
       # CCE labels every node in a custom pool with the pool's name.
       nodeSelector:
-        cce.cloud.com/cce-nodepool: demo-turbo-nodepool-cce-demo
+        cce.cloud.com/cce-nodepool: demo-turbo-nodepool-cce-test
       imagePullSecrets:
         - name: default-secret # the password the node uses to download from SWR
       terminationGracePeriodSeconds: 40   # 10s preStop + 20s Spring shutdown + margin
