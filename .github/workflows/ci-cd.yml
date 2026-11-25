@@ -109,7 +109,7 @@ jobs:
       - name: Install Huawei Cloud SDK (SWR + CCE)
         run: |
           python3 -m venv /tmp/hwsdk
-          /tmp/hwsdk/bin/pip install --quiet --upgrade huaweicloudsdkcore huaweicloudsdkswr huaweicloudsdkcce
+          /tmp/hwsdk/bin/pip install --quiet --upgrade huaweicloudsdkcore huaweicloudsdkswr huaweicloudsdkcce huaweicloudsdkelb
 
       - name: Log in to SWR (temporary bearer token) and push images
         run: |
@@ -315,7 +315,28 @@ jobs:
             echo "Waiting for the Ingress to be attached to the ELB..."; sleep 5
           done
           kubectl -n "${NS}" get ingress apps -o wide || true
-          [ -n "${ELB_PUBLIC_IP}" ] || { echo "::error::Could not find the ELB's public IP"; kubectl -n "${NS}" describe ingress apps | tail -20; exit 1; }
+          # The Ingress status only shows the ELB's PRIVATE IP, so ask the ELB API for its public EIP
+          if [ -z "${ELB_PUBLIC_IP}" ]; then
+            ELB_PUBLIC_IP="$(/tmp/hwsdk/bin/python - <<'PY' || true
+          import os, sys
+          from huaweicloudsdkcore.auth.credentials import BasicCredentials
+          from huaweicloudsdkelb.v3 import ElbClient, ShowLoadBalancerRequest
+          cred = (BasicCredentials(os.environ["HW_ACCESS_KEY"], os.environ["HW_SECRET_KEY"],
+                                   os.environ["HW_PROJECT_ID"])
+                  .with_security_token(os.environ["HW_SECURITY_TOKEN"]))
+          client = (ElbClient.new_builder().with_credentials(cred)
+                    .with_endpoints([f"https://elb.{os.environ['HW_REGION']}.myhuaweicloud.com"]).build())
+          try:
+              lb = client.show_load_balancer(ShowLoadBalancerRequest(loadbalancer_id=os.environ["HW_ELB_ID"])).loadbalancer
+          except Exception as e:
+              print(f"ELB lookup failed: {e}", file=sys.stderr); sys.exit(1)
+          ips = [e.eip_address for e in (lb.eips or []) if e.eip_address] + \
+                [p.publicip_address for p in (lb.publicips or []) if p.publicip_address]
+          if ips: print(ips[0])
+          PY
+            )"
+          fi
+          [ -n "${ELB_PUBLIC_IP}" ] || { echo "::error::Could not find the ELB's public IP (does the ELB have an EIP, and may the agency read ELB?)"; kubectl -n "${NS}" describe ingress apps | tail -20; exit 1; }
           echo "ELB public IP: ${ELB_PUBLIC_IP}"
 
           # ---- 3. Both apps must answer through the SAME ELB ----
