@@ -1,0 +1,72 @@
+# Third sample app (TEMPORARY: delete app3/, this file and its lines in ingress.yaml and the workflow to remove it). It shares the same ELB as demo-api through the Ingress
+# in ingress.yaml: http://<ELB>/app3/... comes here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app3
+  namespace: demo
+  labels:
+    app: app3
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: app3
+  strategy:
+    type: RollingUpdate        # zero downtime: new pod first, then stop the old one
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: app3
+    spec:
+      # Run ONLY on the new node pool (it has auto scaling), never on DefaultPool.
+      # CCE labels every node in a custom pool with the pool's name.
+      nodeSelector:
+        cce.cloud.com/cce-nodepool: demo-turbo-nodepool-cce-test
+      imagePullSecrets:
+        - name: default-secret # SWR pull secret that CCE creates in each namespace
+      containers:
+        - name: app3
+          image: __IMAGE_APP3__  # PLACEHOLDER. The workflow fills it in.
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:            # tiny: nginx needs very little
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /app3/health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /app3/health
+              port: http
+            periodSeconds: 20
+---
+# Internal Service for app3. No ELB of its own: the Ingress reaches it.
+# NodePort is what CCE's ELB Ingress uses on VPC / tunnel network clusters.
+apiVersion: v1
+kind: Service
+metadata:
+  name: app3
+  namespace: demo
+spec:
+  type: NodePort
+  selector:
+    app: app3
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

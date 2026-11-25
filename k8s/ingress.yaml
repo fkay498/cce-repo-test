@@ -25,6 +25,13 @@ spec:
                 name: app2
                 port:
                   number: 8080
+          - path: /app3                 # TEMPORARY third app (node-count test)
+            pathType: Prefix
+            backend:
+              service:
+                name: app3
+                port:
+                  number: 8080
           - path: /
             pathType: Prefix
             backend:
