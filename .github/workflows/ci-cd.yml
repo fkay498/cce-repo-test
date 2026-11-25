@@ -339,7 +339,9 @@ jobs:
           [ -n "${ELB_PUBLIC_IP}" ] || { echo "::error::Could not find the ELB's public IP (does the ELB have an EIP, and may the agency read ELB?)"; kubectl -n "${NS}" describe ingress apps | tail -20; exit 1; }
           echo "ELB public IP: ${ELB_PUBLIC_IP}"
 
-          # ---- 3. Both apps must answer through the SAME ELB ----
+          # Helper for the final check: both apps must answer through the SAME ELB.
+          # (It runs AFTER demo-api is deployed, so a demo-api with no running pods
+          # can still be fixed by this deploy.)
           check() {   # check <path> <text expected in the body>
             for i in $(seq 1 24); do
               BODY="$(curl -s -m 5 -w ' HTTP%{http_code}' "http://${ELB_PUBLIC_IP}$1" || true)"
@@ -350,16 +352,8 @@ jobs:
             done
             echo "  FAIL http://${ELB_PUBLIC_IP}$1 -> ${BODY}"; return 1
           }
-          echo "Routing check through the ELB:"
-          ROUTING_OK=1
-          check /actuator/health '"status":"UP"' || ROUTING_OK=0
-          check /app2/hello '"app":"app2"' || ROUTING_OK=0
-          if [ "$ROUTING_OK" = 0 ]; then
-            kubectl -n "${NS}" describe ingress apps | tail -25 || true
-            echo "::error::The Ingress is not routing both apps through the ELB."; exit 1
-          fi
 
-          # ---- 4. Zero-downtime rollout of demo-api ----
+          # ---- 3. Zero-downtime rollout of demo-api ----
           PROBE_LOG="${RUNNER_TEMP}/probe.log"; : > "$PROBE_LOG"
           echo "Probing http://${ELB_PUBLIC_IP}/actuator/health during the rollout"
           ( while true; do
@@ -394,6 +388,16 @@ jobs:
           fi
           sleep 15   # let the old pod drain (preStop 10s) before stopping the probe
           stop_probe
+
+          # ---- 4. Both apps must answer through the SAME ELB ----
+          echo "Routing check through the ELB:"
+          ROUTING_OK=1
+          check /actuator/health '"status":"UP"' || ROUTING_OK=0
+          check /app2/hello '"app":"app2"' || ROUTING_OK=0
+          if [ "$ROUTING_OK" = 0 ]; then
+            kubectl -n "${NS}" describe ingress apps | tail -25 || true
+            echo "::error::The Ingress is not routing both apps through the ELB."; exit 1
+          fi
           kubectl -n "${NS}" get deploy,pods,svc,ingress -o wide
           # HPA status. TARGETS "<unknown>" means the Metrics Server add-on is missing,
           # so the HPA can't read CPU yet (install "Kubernetes Metrics Server" in CCE Add-ons).
