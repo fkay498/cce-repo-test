@@ -1,4 +1,5 @@
-# ONE ELB for SEVERAL apps.
+# ONE ELB for SEVERAL apps, routed by host name AND by path.
+#   http://app1.qucoon.cloud/... -> demo-api,  http://app2.qucoon.cloud/... -> app2
 # The Ingress owns the ELB's port-80 listener and routes each request by path:
 #   http://<ELB>/app2/...  -> app2
 #   http://<ELB>/...       -> demo-api   (everything else, incl. /actuator/health)
@@ -16,6 +17,28 @@ metadata:
 spec:
   ingressClassName: cce                   # CCE's ELB Ingress
   rules:
+    # Host-based routing: each app has its own host name (DNS points them all at the ELB)
+    - host: app1.qucoon.cloud             # demo-api
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-api
+                port:
+                  number: 80
+    - host: app2.qucoon.cloud             # app2
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app2
+                port:
+                  number: 8080
+    # Path-based routing (no host): used by the ELB IP and by API Gateway
     - http:
         paths:
           - path: /app2
