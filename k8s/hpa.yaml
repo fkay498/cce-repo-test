@@ -1,0 +1,39 @@
+# HPA = Horizontal Pod Autoscaler: adds or removes demo-api PODS based on load.
+#   - Normal load: 1 pod (cheapest).
+#   - Average CPU above 70% of what a pod requests (250m -> ~175m): add pods, up to 3.
+#   - Load drops: remove extra pods again (after 5 quiet minutes, to avoid flapping).
+# If the new pods don't fit on the nodes, the CCE Cluster Autoscaler (node pool
+# auto scaling) adds a node for them.
+# Needs the "Kubernetes Metrics Server" add-on (CCE console > Add-ons) to read CPU.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: demo-api
+  namespace: demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: demo-api
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # % of the pod's CPU request (250m)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0      # react to load quickly
+      policies:
+        - type: Pods
+          value: 1                       # add at most 1 pod...
+          periodSeconds: 60              # ...per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300    # wait 5 quiet minutes before removing pods
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

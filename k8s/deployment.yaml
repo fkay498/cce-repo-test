@@ -6,7 +6,8 @@ metadata:
   labels:
     app: demo-api
 spec:
-  replicas: 1                  # how many copies of the app to keep running
+  # No "replicas:" here on purpose: the HPA (k8s/hpa.yaml) decides how many
+  # copies run (1 to 3). If this file set a number, every deploy would reset it.
   revisionHistoryLimit: 3      # remember 3 old versions so we can roll back
   selector:
     matchLabels:
