@@ -3,15 +3,16 @@ kind: Service
 metadata:
   name: demo-api
   namespace: demo
-  annotations:
-    kubernetes.io/elb.id: "__ELB_ID__"   # PLACEHOLDER. Which ELB to use. Step C fills it in.
-    kubernetes.io/elb.class: performance # dedicated ELB
 spec:
-  type: LoadBalancer      # "expose this through a load balancer"
+  # Internal Service. It no longer owns the ELB itself: the Ingress in
+  # ingress.yaml owns the ELB's port-80 listener and sends traffic here,
+  # so the same ELB can serve several apps (see app2.yaml).
+  # NodePort is what CCE's ELB Ingress uses on VPC / tunnel network clusters.
+  type: NodePort
   selector:
     app: demo-api         # send traffic to pods with this label
   ports:
     - name: http
-      port: 80            # the port people use on the ELB
+      port: 80            # the port the Ingress uses
       targetPort: 8080    # the port on the pod
       protocol: TCP

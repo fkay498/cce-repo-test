@@ -85,12 +85,18 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon test
 
-      - name: Build Docker image (linux/amd64)
+      - name: Build Docker images (linux/amd64)
         run: |
           IMAGE="swr.${HW_REGION}.myhuaweicloud.com/${SWR_ORG}/${APP_NAME}"
           echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
           docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
             -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
+
+          # Second sample app (app2/): shares the same ELB through the Ingress
+          IMAGE_APP2="swr.${HW_REGION}.myhuaweicloud.com/${SWR_ORG}/app2"
+          echo "IMAGE_APP2=${IMAGE_APP2}" >> "$GITHUB_ENV"
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
+            -t "${IMAGE_APP2}:${GITHUB_SHA}" -t "${IMAGE_APP2}:latest" app2
 
       # ---- Stage 3: push to SWR ----
       # The temporary AK/SK from OIDC cannot be used directly as a docker password
@@ -154,6 +160,8 @@ jobs:
           printf '%s' "${SWR_PASS}" | docker login -u "${SWR_USER}" --password-stdin "${SWR_HOST}"
           docker push "${IMAGE}:${GITHUB_SHA}"
           docker push "${IMAGE}:latest"
+          docker push "${IMAGE_APP2}:${GITHUB_SHA}"
+          docker push "${IMAGE_APP2}:latest"
 
       # ---- Stage 4: deploy to CCE ----
       # Step 4a: ask CCE for a short-lived kubeconfig (1 day), using the same
@@ -209,7 +217,7 @@ jobs:
           # Grant them in CCE console > cluster > Permissions (agency github-actions).
           echo "RBAC check in namespace ${K8S_NAMESPACE}:"
           OK=1
-          for r in deployments services secrets; do
+          for r in deployments services secrets ingresses.networking.k8s.io; do
             for v in get create patch; do
               if kubectl auth can-i "$v" "$r" -n "${K8S_NAMESPACE}" >/dev/null 2>&1; then
                 echo "  yes  $v $r"
@@ -220,55 +228,117 @@ jobs:
           done
           [ "$OK" = 1 ] || { echo "The agency lacks Kubernetes permissions in namespace ${K8S_NAMESPACE}."; exit 1; }
 
-      # Step 4b: zero-downtime rolling deployment.
-      #  - k8s/deployment.yaml uses maxSurge 1 / maxUnavailable 0: the NEW pod is
-      #    started first and the OLD pod is only stopped once the new one is healthy.
-      #  - While the rollout runs, we call the public health URL every second and
-      #    count failed requests, to prove there was no downtime.
-      #  - If the new pod never becomes healthy, we roll back, so the old version
-      #    keeps serving and no broken half-finished deploy is left behind.
-      - name: Deploy to CCE (zero-downtime rolling update)
+      # Step 4b: deploy BOTH apps behind ONE ELB, with zero downtime for demo-api.
+      #  1. app2 + the internal (NodePort) Services are applied first.
+      #  2. The Ingress (k8s/ingress.yaml) takes the ELB's port-80 listener and
+      #     routes /app2/... -> app2 and everything else -> demo-api.
+      #     (First run only: demo-api's Service used to own that listener as a
+      #     LoadBalancer Service, so we wait for CCE to release it before the
+      #     Ingress claims it. Expect a short gap on that first run only.)
+      #  3. We check through the ELB that both apps answer on their paths.
+      #  4. demo-api is rolled out with maxSurge 1 / maxUnavailable 0 (new pod
+      #     first, old pod stopped only when the new one is healthy), while a
+      #     probe calls the public health URL every second to prove no downtime.
+      #     If the new pod never becomes healthy, we roll back.
+      - name: Deploy to CCE (two apps, one ELB, zero-downtime rolling update)
         run: |
           set -euo pipefail
           [ -n "${HW_ELB_ID}" ] || { echo "MISSING VARIABLE: HW_ELB_ID"; exit 1; }
+          NS="${K8S_NAMESPACE}"
+
           # Creating a namespace is a cluster-wide right; only do it if we have it.
           if kubectl auth can-i create namespaces >/dev/null 2>&1; then
             kubectl apply -f k8s/namespace.yaml
           else
-            echo "No cluster-wide namespace rights; assuming namespace ${K8S_NAMESPACE} already exists."
+            echo "No cluster-wide namespace rights; assuming namespace ${NS} already exists."
           fi
 
           # CCE creates "default-secret" (SWR pull secret) in new namespaces; wait for it
           for i in $(seq 1 12); do
-            kubectl -n "${K8S_NAMESPACE}" get secret default-secret >/dev/null 2>&1 && break
-            echo "Waiting for default-secret in ${K8S_NAMESPACE}..."; sleep 5
+            kubectl -n "${NS}" get secret default-secret >/dev/null 2>&1 && break
+            echo "Waiting for default-secret in ${NS}..."; sleep 5
           done
 
+          # Fill in the placeholders
           mkdir -p "${RUNNER_TEMP}/k8s"
-          for f in deployment.yaml service.yaml; do
+          for f in deployment.yaml service.yaml app2.yaml ingress.yaml; do
             sed -e "s|__IMAGE__|${IMAGE}:${GITHUB_SHA}|g" \
+                -e "s|__IMAGE_APP2__|${IMAGE_APP2}:${GITHUB_SHA}|g" \
                 -e "s|__ELB_ID__|${HW_ELB_ID}|g" "k8s/$f" > "${RUNNER_TEMP}/k8s/$f"
           done
-          # Find the ELB's public IP (skip private 10.x / 172.16-31.x / 192.168.x addresses)
-          PUBLIC_IP=$(kubectl -n "${K8S_NAMESPACE}" get svc "${APP_NAME}" \
-            -o jsonpath='{range .status.loadBalancer.ingress[*]}{.ip}{"\n"}{end}' 2>/dev/null \
-            | grep -vE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -n 1 || true)
 
-          # Downtime probe: one request per second until the rollout ends
-          PROBE_LOG="${RUNNER_TEMP}/probe.log"; : > "$PROBE_LOG"
-          if [ -n "$PUBLIC_IP" ]; then
-            echo "Probing http://${PUBLIC_IP}/actuator/health during the rollout"
-            ( while true; do
-                curl -s -o /dev/null -m 3 -w '%{http_code}\n' "http://${PUBLIC_IP}/actuator/health" >> "$PROBE_LOG" || echo "000" >> "$PROBE_LOG"
-                sleep 1
-              done ) &
-            PROBE_PID=$!
-          else
-            echo "No public IP on the service yet; skipping the downtime probe."
-            PROBE_PID=""
+          # Public (non-private) IPs from a Service's or Ingress's load-balancer status
+          public_ip() {
+            kubectl -n "${NS}" get "$1" -o jsonpath='{range .status.loadBalancer.ingress[*]}{.ip}{"\n"}{end}' 2>/dev/null \
+              | grep -vE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -n 1 || true
+          }
+          # Print why pods are not running (scheduler / probe messages + recent events)
+          diag() {
+            kubectl -n "${NS}" get pods -o wide || true
+            echo "Why each pod is not scheduled / not ready:"
+            kubectl -n "${NS}" get pods -o \
+              jsonpath='{range .items[*]}{.metadata.name}{": "}{range .status.conditions[?(@.status=="False")]}{.type}{" -> "}{.message}{"  "}{end}{"\n"}{end}' || true
+            kubectl -n "${NS}" get events --sort-by=.lastTimestamp 2>&1 | tail -15 || true
+          }
+
+          # Remember the ELB's public IP while demo-api's Service may still own it (first run)
+          ELB_PUBLIC_IP="$(public_ip "svc/${APP_NAME}")"
+
+          # ---- 1. app2 and the internal Services ----
+          kubectl apply -f "${RUNNER_TEMP}/k8s/service.yaml" -f "${RUNNER_TEMP}/k8s/app2.yaml"
+          if ! kubectl -n "${NS}" rollout status deployment/app2 --timeout=3m; then
+            echo "app2 did not become ready:"; diag
+            kubectl -n "${NS}" rollout undo deployment/app2 || true
+            exit 1
           fi
+
+          # ---- 2. Ingress takes over the ELB's port-80 listener ----
+          # Wait until demo-api's Service no longer holds the ELB (only matters on the first run)
+          for i in $(seq 1 24); do
+            [ -z "$(kubectl -n "${NS}" get svc "${APP_NAME}" -o jsonpath='{.status.loadBalancer.ingress}' 2>/dev/null)" ] && break
+            echo "Waiting for CCE to release the ELB listener from the demo-api Service..."; sleep 5
+          done
+          kubectl apply -f "${RUNNER_TEMP}/k8s/ingress.yaml"
+          for i in $(seq 1 36); do
+            IP="$(public_ip ingress/apps)"
+            [ -n "$IP" ] && { ELB_PUBLIC_IP="$IP"; break; }
+            [ -n "$(kubectl -n "${NS}" get ingress apps -o jsonpath='{.status.loadBalancer.ingress}' 2>/dev/null)" ] && break
+            echo "Waiting for the Ingress to be attached to the ELB..."; sleep 5
+          done
+          kubectl -n "${NS}" get ingress apps -o wide || true
+          [ -n "${ELB_PUBLIC_IP}" ] || { echo "::error::Could not find the ELB's public IP"; kubectl -n "${NS}" describe ingress apps | tail -20; exit 1; }
+          echo "ELB public IP: ${ELB_PUBLIC_IP}"
+
+          # ---- 3. Both apps must answer through the SAME ELB ----
+          check() {   # check <path> <text expected in the body>
+            for i in $(seq 1 24); do
+              BODY="$(curl -s -m 5 -w ' HTTP%{http_code}' "http://${ELB_PUBLIC_IP}$1" || true)"
+              if [[ "$BODY" == *"HTTP200"* && "$BODY" == *"$2"* ]]; then
+                echo "  OK  http://${ELB_PUBLIC_IP}$1 -> ${BODY}"; return 0
+              fi
+              sleep 5
+            done
+            echo "  FAIL http://${ELB_PUBLIC_IP}$1 -> ${BODY}"; return 1
+          }
+          echo "Routing check through the ELB:"
+          ROUTING_OK=1
+          check /actuator/health '"status":"UP"' || ROUTING_OK=0
+          check /app2/hello '"app":"app2"' || ROUTING_OK=0
+          if [ "$ROUTING_OK" = 0 ]; then
+            kubectl -n "${NS}" describe ingress apps | tail -25 || true
+            echo "::error::The Ingress is not routing both apps through the ELB."; exit 1
+          fi
+
+          # ---- 4. Zero-downtime rollout of demo-api ----
+          PROBE_LOG="${RUNNER_TEMP}/probe.log"; : > "$PROBE_LOG"
+          echo "Probing http://${ELB_PUBLIC_IP}/actuator/health during the rollout"
+          ( while true; do
+              curl -s -o /dev/null -m 3 -w '%{http_code}\n' "http://${ELB_PUBLIC_IP}/actuator/health" >> "$PROBE_LOG" || echo "000" >> "$PROBE_LOG"
+              sleep 1
+            done ) &
+          PROBE_PID=$!
           stop_probe() {
-            [ -n "$PROBE_PID" ] && kill "$PROBE_PID" 2>/dev/null || true
+            kill "$PROBE_PID" 2>/dev/null || true
             TOTAL=$(wc -l < "$PROBE_LOG" | tr -d ' ')
             FAILED=$(grep -vc '^200$' "$PROBE_LOG" || true)
             echo "Downtime probe: ${TOTAL} requests, ${FAILED} failed"
@@ -277,26 +347,18 @@ jobs:
             fi
           }
 
-          kubectl apply -f "${RUNNER_TEMP}/k8s/deployment.yaml" -f "${RUNNER_TEMP}/k8s/service.yaml"
-
-          if ! kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=5m; then
-            echo "Rollout failed. Pods and recent events:"
-            kubectl -n "${K8S_NAMESPACE}" get pods -o wide || true
-            echo "Why each pod is not scheduled / not ready (from the pod's own status):"
-            kubectl -n "${K8S_NAMESPACE}" get pods -l "app=${APP_NAME}" -o \
-              jsonpath='{range .items[*]}{.metadata.name}{": "}{range .status.conditions[?(@.status=="False")]}{.type}{" -> "}{.message}{"  "}{end}{"\n"}{end}' || true
-            kubectl -n "${K8S_NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 | tail -15 || true
-            # Roll back: the old pod was never stopped (maxUnavailable 0), so this just
-            # removes the stuck new pod and leaves the old version serving.
-            echo "Rolling back to the previous version..."
-            kubectl -n "${K8S_NAMESPACE}" rollout undo "deployment/${APP_NAME}" || true
-            kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=3m || true
+          kubectl apply -f "${RUNNER_TEMP}/k8s/deployment.yaml"
+          if ! kubectl -n "${NS}" rollout status "deployment/${APP_NAME}" --timeout=5m; then
+            echo "Rollout failed:"; diag
+            # The old pod was never stopped (maxUnavailable 0): undo just removes the stuck new pod.
+            echo "Rolling back demo-api to the previous version..."
+            kubectl -n "${NS}" rollout undo "deployment/${APP_NAME}" || true
+            kubectl -n "${NS}" rollout status "deployment/${APP_NAME}" --timeout=3m || true
             stop_probe
-            echo "::error::New version did not become healthy; rolled back. The previous version is still serving."
+            echo "::error::New demo-api version did not become healthy; rolled back. The previous version is still serving (app2 and the Ingress are deployed)."
             exit 1
           fi
-          # Give the old pod time to drain (preStop 10s) before stopping the probe
-          sleep 15
+          sleep 15   # let the old pod drain (preStop 10s) before stopping the probe
           stop_probe
-          kubectl -n "${K8S_NAMESPACE}" get deploy,pods,svc -o wide
-          echo "Deployed ${IMAGE}:${GITHUB_SHA}"
+          kubectl -n "${NS}" get deploy,pods,svc,ingress -o wide
+          echo "Deployed ${IMAGE}:${GITHUB_SHA} and ${IMAGE_APP2}:${GITHUB_SHA} behind ELB ${ELB_PUBLIC_IP}"

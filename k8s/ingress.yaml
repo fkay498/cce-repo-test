@@ -1,0 +1,34 @@
+# ONE ELB for SEVERAL apps.
+# The Ingress owns the ELB's port-80 listener and routes each request by path:
+#   http://<ELB>/app2/...  -> app2
+#   http://<ELB>/...       -> demo-api   (everything else, incl. /actuator/health)
+# The longest matching path wins, so /app2 is checked before /.
+# To add another app: deploy it with a NodePort Service and add a path below.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: apps
+  namespace: demo
+  annotations:
+    kubernetes.io/elb.id: "__ELB_ID__"     # PLACEHOLDER: the existing ELB (workflow fills it in)
+    kubernetes.io/elb.class: performance  # dedicated ELB
+    kubernetes.io/elb.port: "80"          # listener port on the ELB
+spec:
+  ingressClassName: cce                   # CCE's ELB Ingress
+  rules:
+    - http:
+        paths:
+          - path: /app2
+            pathType: Prefix
+            backend:
+              service:
+                name: app2
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-api
+                port:
+                  number: 80
